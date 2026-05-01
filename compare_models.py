@@ -42,8 +42,10 @@ METRIC_PREFIXES = {
 METRIC_ORDER = ["accuracy", "precision", "recall", "specificity", "roc_auc", "f1", "mcc"]
 
 TASK_RESULT_FILES = {
-    "AD_CONTROL": LOG_DIR / "comparison_results_ad_control.csv",
-    "MCI_CONTROL": LOG_DIR / "comparison_results_mci_control.csv",
+    "AD_CONTROL_DLPFC": LOG_DIR / "comparison_results_AD_CONTROL_DLPFC.csv",
+    "AD_CONTROL_PCC":   LOG_DIR / "comparison_results_AD_CONTROL_PCC.csv",
+    "MCI_CONTROL_DLPFC": LOG_DIR / "comparison_results_MCI_CONTROL_DLPFC.csv",
+    "MCI_CONTROL_PCC":   LOG_DIR / "comparison_results_MCI_CONTROL_PCC.csv",
 }
 
 TASK_METRIC_COLUMNS = [

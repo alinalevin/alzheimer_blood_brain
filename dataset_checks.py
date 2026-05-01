@@ -345,6 +345,147 @@ def drop_duplicate_individuals(metadata: pd.DataFrame) -> pd.DataFrame:
     return deduped
 
 
+def summarize_blood_timing(metadata: pd.DataFrame, output_html: Optional[Path] = None) -> pd.DataFrame:
+    """Analyse how long before death (and before final diagnosis) blood samples were drawn.
+
+    ROSMAP blood samples are drawn at each participant's last clinical visit
+    (``dcfdx_lv`` = diagnosis at last visit).  Because ages above 90 are
+    privacy-capped at 95 in the public release, a small number of records
+    show a negative gap; those are flagged rather than dropped.
+
+    Parameters
+    ----------
+    metadata:
+        Blood metadata DataFrame (must contain ``age_at_exam_num``,
+        ``age_death_num``, ``condition``, ``dcfdx_lv``).
+    output_html:
+        If given, save an interactive Plotly figure to this path.
+
+    Returns
+    -------
+    DataFrame with per-participant timing added as new columns.
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    DCFDX_MAP = {1: "NCI", 2: "MCI", 3: "MCI+other", 4: "AD dementia", 5: "other dementia"}
+    CONDITION_ORDER = ["AD", "MCI", "CONTROL"]
+    COLOR_MAP = {"AD": "#d62728", "MCI": "#ff7f0e", "CONTROL": "#1f77b4"}
+
+    df = metadata.copy()
+    df["years_before_death"] = df["age_death_num"] - df["age_at_exam_num"]
+    df["dcfdx_label"] = df["dcfdx_lv"].map(DCFDX_MAP)
+
+    # ── Textual summary ──────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Blood sample timing analysis")
+    print("(age_at_exam_num = age at last clinical visit / blood draw)")
+    print("=" * 60)
+
+    print("\nDiagnosis at blood draw (dcfdx_lv) vs classifier label:")
+    print(pd.crosstab(df["condition"], df["dcfdx_label"]).to_string())
+
+    print("\nAge at blood draw by condition:")
+    print(df.groupby("condition")["age_at_exam_num"].describe().round(1).to_string())
+
+    print("\nYears from blood draw to death by condition:")
+    timing_stats = df.groupby("condition")["years_before_death"].agg(
+        ["mean", "median", "std", "min", "max"]
+    ).round(2)
+    print(timing_stats.to_string())
+
+    print("\nNote: negative values (~2 records) reflect the 90+ age-capping artefact in ROSMAP.")
+
+    for cond in CONDITION_ORDER:
+        sub = df[df["condition"] == cond]
+        if sub.empty:
+            continue
+        sub_pos = sub[sub["years_before_death"] >= 0]
+        n = len(sub_pos)
+        if n == 0:
+            continue
+        w0  = (sub_pos["years_before_death"] == 0).sum()
+        w2  = (sub_pos["years_before_death"] <= 2).sum()
+        w5  = (sub_pos["years_before_death"] <= 5).sum()
+        w10 = (sub_pos["years_before_death"] <= 10).sum()
+        print(
+            f"\n{cond} (n={n}, excluding age-cap artefacts):\n"
+            f"  blood drawn same year as death   : {w0:>3} ({w0/n:.1%})\n"
+            f"  blood drawn within  2 yrs of death: {w2:>3} ({w2/n:.1%})\n"
+            f"  blood drawn within  5 yrs of death: {w5:>3} ({w5/n:.1%})\n"
+            f"  blood drawn within 10 yrs of death: {w10:>3} ({w10/n:.1%})"
+        )
+
+    # ── Plotly figure ────────────────────────────────────────────────────────
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        # Clip to ≥ 0 for plotting (removes age-cap artefacts)
+        plot_df = df[df["years_before_death"] >= 0].copy()
+
+        fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=(
+                "Years from blood draw to death (by condition)",
+                "Age at blood draw (by condition)",
+            ),
+        )
+
+        for cond in CONDITION_ORDER:
+            sub = plot_df[plot_df["condition"] == cond]["years_before_death"]
+            fig.add_trace(
+                go.Box(
+                    y=sub,
+                    name=cond,
+                    marker_color=COLOR_MAP[cond],
+                    boxmean="sd",
+                    showlegend=True,
+                ),
+                row=1, col=1,
+            )
+
+        for cond in CONDITION_ORDER:
+            sub = plot_df[plot_df["condition"] == cond]["age_at_exam_num"]
+            fig.add_trace(
+                go.Box(
+                    y=sub,
+                    name=cond,
+                    marker_color=COLOR_MAP[cond],
+                    boxmean="sd",
+                    showlegend=False,
+                ),
+                row=1, col=2,
+            )
+
+        fig.update_layout(
+            title_text=(
+                "ROSMAP Blood Sample Timing<br>"
+                "<sup>Samples drawn at last clinical visit (dcfdx_lv). "
+                "Age ≥ 90 capped at 95 in public release.</sup>"
+            ),
+            template="plotly_white",
+            height=520,
+            width=1000,
+            legend_title_text="Condition",
+            boxmode="group",
+        )
+        fig.update_yaxes(title_text="Years before death", row=1, col=1)
+        fig.update_yaxes(title_text="Age at blood draw", row=1, col=2)
+
+        if output_html:
+            output_html.parent.mkdir(parents=True, exist_ok=True)
+            fig.write_html(str(output_html), include_plotlyjs="cdn")
+            print(f"\nTiming plot saved to: {output_html}")
+        else:
+            fig.show()
+
+    except ImportError:
+        print("plotly not available – skipping figure generation.")
+
+    return df
+
+
 def main() -> None:
     args = parse_args()
     blood_paths, brain_paths = resolve_paths(args)
@@ -357,6 +498,8 @@ def main() -> None:
     summarize_dataset("Blood", blood_counts, blood_metadata)
     summarize_dataset_by_tissue("Brain", brain_counts, brain_metadata, dge_gene_sets=dge_gene_sets)
     summarize_intersection_by_tissue(blood_counts, brain_counts, blood_metadata, brain_metadata, dge_gene_sets=dge_gene_sets)
+    timing_html = BASE_DIR / "files" / "blood_timing_plot.html"
+    summarize_blood_timing(blood_metadata, output_html=timing_html)
 
 
 if __name__ == "__main__":

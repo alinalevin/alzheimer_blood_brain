@@ -9,9 +9,17 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 
 DEFAULT_CSV = Path(__file__).resolve().parent / "files" / "log_model_comparison.csv"
-DEFAULT_TASK_CSV = Path(__file__).resolve().parent.parent / "task_comparison_metrics.csv"
+DEFAULT_TASK_CSV = Path(__file__).resolve().parent / "files" / "task_comparison_metrics.csv"
 DEFAULT_HTML = Path(__file__).resolve().parent / "files" / "log_model_comparison_plot.html"
 DEFAULT_PNG = Path(__file__).resolve().parent / "files" / "log_model_comparison_plot.png"
+
+# LOO result files – one per (task, tissue) combination
+TASK_LOO_FILES = {
+    "AD_CONTROL_DLPFC":  Path(__file__).resolve().parent / "files" / "comparison_results_AD_CONTROL_DLPFC.csv",
+    "AD_CONTROL_PCC":    Path(__file__).resolve().parent / "files" / "comparison_results_AD_CONTROL_PCC.csv",
+    "MCI_CONTROL_DLPFC": Path(__file__).resolve().parent / "files" / "comparison_results_MCI_CONTROL_DLPFC.csv",
+    "MCI_CONTROL_PCC":   Path(__file__).resolve().parent / "files" / "comparison_results_MCI_CONTROL_PCC.csv",
+}
 METRICS = (
     "accuracy",
     "f1",
@@ -44,11 +52,50 @@ def load_task_comparison(csv_path: Path) -> pd.DataFrame:
     return df
 
 
+def load_loo_comparison(task_loo_files: dict) -> pd.DataFrame:
+    """Load per-subject LOO results and compute per-(task, tissue) aggregate metrics.
+
+    Returns a DataFrame with columns: task, tissue, model, blood_accuracy,
+    blood_f1, blood_roc_auc, brain_accuracy, brain_f1, brain_roc_auc.
+    """
+    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+
+    rows = []
+    for key, path in task_loo_files.items():
+        if not path.exists():
+            print(f"  Missing LOO file: {path}")
+            continue
+        df = pd.read_csv(path, index_col=0)
+        # key is like AD_CONTROL_DLPFC or MCI_CONTROL_PCC
+        parts = key.rsplit("_", 1)
+        task = parts[0]   # AD_CONTROL or MCI_CONTROL
+        tissue = parts[1] # DLPFC or PCC
+
+        y_true = df["true_label_num"].astype(int)
+        row = {"task": task, "tissue": tissue, "model": "Leave One Out"}
+        for src, pred_col, prob_col in [
+            ("blood", "prediction_blood", "probability_blood"),
+            ("brain", "prediction_brain", "probability_brain"),
+        ]:
+            y_pred = df[pred_col].astype(int)
+            row[f"{src}_accuracy"] = accuracy_score(y_true, y_pred)
+            row[f"{src}_f1"] = f1_score(y_true, y_pred, zero_division=0)
+            try:
+                row[f"{src}_roc_auc"] = roc_auc_score(y_true, df[prob_col].astype(float))
+            except Exception:
+                row[f"{src}_roc_auc"] = float("nan")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def melt_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    id_vars = ["task", "model"]
+    if "tissue" in df.columns:
+        id_vars.append("tissue")
     records = []
     for metric in METRICS:
         metric_df = df.melt(
-            id_vars=["task", "model"],
+            id_vars=id_vars,
             value_vars=[f"blood_{metric}", f"brain_{metric}"],
             var_name="source",
             value_name="score",
@@ -81,13 +128,14 @@ def select_best_model(df: pd.DataFrame, task: str, source: str = "blood") -> str
     return task_df.loc[best_idx, "model"]
 
 
-def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Optional[pd.DataFrame] = None):
+def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Optional[pd.DataFrame] = None, tissue: Optional[str] = None):
     """Create a bar plot comparing blood vs brain model performance.
 
     Args:
         long_df: DataFrame in long format with columns: task, model, source, metric, score
         single_task: If provided, filter to only this task and create a single-row plot
         df: Original dataframe (needed for best model selection)
+        tissue: Optional tissue label (DLPFC or PCC) to include in the title
     """
     # Format task names for better display
     def format_task_name(task: str) -> str:
@@ -101,12 +149,14 @@ def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Op
     long_df["task_original"] = long_df["task"]  # Keep original for filtering
     long_df["task"] = long_df["task"].apply(format_task_name)
 
+    tissue_label = f" – Blood vs {tissue}" if tissue else ""
+
     if single_task:
         formatted_task = format_task_name(single_task)
 
         # Find best model for blood
         best_model = select_best_model(df, single_task, "blood")
-        print(f"Best model for {formatted_task}: {best_model}")
+        print(f"Best model for {formatted_task}{tissue_label}: {best_model}")
 
         # Filter to only the best model and the specified task
         plot_df = long_df[
@@ -117,31 +167,41 @@ def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Op
         if plot_df.empty:
             raise ValueError(f"No data found for task: {single_task}, model: {best_model}")
 
+        # Source label: rename "Brain" → tissue name when known
+        if tissue:
+            plot_df["source"] = plot_df["source"].replace({"Brain": tissue})
+
         # Create simple bar plot with metrics on x-axis
+        source_order = ["Blood", tissue if tissue else "Brain"]
+        color_map = {source_order[0]: "#ffb3ba", source_order[1]: "#bae1ff"}
         fig = px.bar(
             plot_df,
             x="metric",
             y="score",
             color="source",
             barmode="group",
-            category_orders={"source": ["Blood", "Brain"]},
-            color_discrete_map={"Blood": "#ffb3ba", "Brain": "#bae1ff"},  # Pastel red and blue
+            category_orders={"source": source_order},
+            color_discrete_map=color_map,
             height=500,
             width=800,
-            text="score",  # Add text labels
+            text="score",
         )
-        fig.update_traces(texttemplate='%{text:.3f}', textposition='outside')  # Format numbers to 3 decimals
-        fig.update_yaxes(range=[0, 1.05], title="Score")  # Slightly extend y-axis for labels
+        fig.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+        fig.update_yaxes(range=[0, 1.05], title="Score")
         fig.update_xaxes(title="Metric")
         fig.update_layout(
-            title=f"{formatted_task} - {best_model}",
+            title=f"{formatted_task}{tissue_label}<br>{best_model}",
             legend_title_text="Dataset",
             bargap=0.15,
             template="plotly_white",
             font=dict(size=14),
         )
     else:
-        # Original multi-task layout
+        # Multi-task layout: rename "Brain" source to tissue name
+        if tissue:
+            long_df["source"] = long_df["source"].replace({"Brain": tissue})
+        source_order = ["Blood", tissue if tissue else "Brain"]
+        color_map = {source_order[0]: "#d62728", source_order[1]: "#1f77b4"}
         fig = px.bar(
             long_df,
             x="model",
@@ -150,13 +210,14 @@ def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Op
             barmode="group",
             facet_row="task",
             facet_col="metric",
-            category_orders={"source": ["Blood", "Brain"]},
-            color_discrete_map={"Blood": "#d62728", "Brain": "#1f77b4"},
+            category_orders={"source": source_order},
+            color_discrete_map=color_map,
             height=600,
         )
         fig.update_yaxes(matches=None, range=[0, 1])
+        title = f"Blood vs {tissue} Model Performance" if tissue else "Blood vs Brain Model Performance"
         fig.update_layout(
-            title="Blood vs Brain Model Performance",
+            title=title,
             legend_title_text="Dataset",
             bargap=0.12,
             template="plotly_white",
@@ -180,37 +241,70 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     count_plots()
 
-    # Load appropriate CSV based on flag
+    output_dir = Path(__file__).resolve().parent / "files"
+
     if args.use_task_csv:
-        csv_path = DEFAULT_TASK_CSV if args.csv == DEFAULT_CSV else args.csv
-        df = load_task_comparison(csv_path)
-        print(f"Loading task comparison data from: {csv_path}")
+        # Use per-subject LOO files to build separate plots per tissue
+        loo_df = load_loo_comparison(TASK_LOO_FILES)
+        if loo_df.empty:
+            print("No LOO comparison files found.")
+            return
+
+        tissues = loo_df["tissue"].unique() if "tissue" in loo_df.columns else [None]
+        tasks_in_data = loo_df["task"].unique()
+
+        for tissue in sorted(tissues):
+            tissue_df = loo_df[loo_df["tissue"] == tissue].copy() if tissue else loo_df.copy()
+
+            # Determine which tasks to plot
+            if args.task:
+                if args.task not in tasks_in_data:
+                    print(f"Task {args.task} not found for tissue {tissue}. Available: {list(tasks_in_data)}")
+                    continue
+                plot_tasks = [args.task]
+            else:
+                plot_tasks = list(tasks_in_data)
+
+            for task in sorted(plot_tasks):
+                task_tissue_df = tissue_df[tissue_df["task"] == task].copy()
+                if task_tissue_df.empty:
+                    continue
+                long_df = melt_to_long(task_tissue_df)
+                fig = make_figure(long_df, single_task=task, df=task_tissue_df, tissue=tissue)
+
+                tissue_str = f"_{tissue.lower()}" if tissue else ""
+                task_str = f"_{task.lower()}"
+                html_filename = f"task_comparison{task_str}{tissue_str}_plot.html"
+                html_out = output_dir / html_filename
+                fig.write_html(html_out, include_plotlyjs="cdn")
+                print(f"Plot saved to: {html_out}")
+
+                if args.png_out:
+                    png_out = output_dir / html_filename.replace(".html", ".png")
+                    fig.write_image(str(png_out))
+                if not args.no_show:
+                    fig.show()
     else:
+        # Log-model comparison (not tissue-split)
         df = load_comparison(args.csv)
+        long_df = melt_to_long(df)
+        fig = make_figure(long_df, single_task=args.task, df=df)
 
-    long_df = melt_to_long(df)
-    fig = make_figure(long_df, single_task=args.task, df=df)
+        if args.html_out == DEFAULT_HTML:
+            prefix = "log_model_comparison"
+            task_suffix = f"_{args.task.lower()}" if args.task else ""
+            html_filename = f"{prefix}{task_suffix}_plot.html"
+            html_out = output_dir / html_filename
+        else:
+            html_out = args.html_out
 
-    # Generate appropriate filename based on task and csv type
-    if args.html_out == DEFAULT_HTML:  # Only modify if using default
-        output_dir = Path(__file__).resolve().parent / "files"
+        fig.write_html(html_out, include_plotlyjs="cdn")
+        print(f"Plot saved to: {html_out}")
 
-        # Build filename components
-        prefix = "task_comparison" if args.use_task_csv else "log_model_comparison"
-        task_suffix = f"_{args.task.lower()}" if args.task else ""
-        html_filename = f"{prefix}{task_suffix}_plot.html"
-
-        html_out = output_dir / html_filename
-    else:
-        html_out = args.html_out
-
-    fig.write_html(html_out, include_plotlyjs="cdn")
-    print(f"Plot saved to: {html_out}")
-
-    if args.png_out:
-        fig.write_image(args.png_out)
-    if not args.no_show:
-        fig.show()
+        if args.png_out:
+            fig.write_image(str(args.png_out))
+        if not args.no_show:
+            fig.show()
 
 
 def count_plots():

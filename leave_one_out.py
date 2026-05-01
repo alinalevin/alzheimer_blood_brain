@@ -7,6 +7,7 @@ reports which tissue-specific classifier performed better for each subject.
 from __future__ import annotations
 
 import argparse
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Optional
@@ -17,6 +18,10 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.model_selection import LeaveOneOut
 from sklearn.utils.class_weight import compute_sample_weight
+
+# Suppress noisy FutureWarnings from sklearn/imbalanced-learn version mismatches
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_BLOOD_DIR = BASE_DIR / "files" / "blood"
@@ -129,21 +134,27 @@ def decode_labels(series: pd.Series, task: str) -> pd.Series:
 def leave_one_out_predict(bundle: TissueModelBundle) -> pd.DataFrame:
     X = bundle.features
     y = bundle.labels.loc[X.index].astype(int)
-    indices = np.arange(len(X))
-    predictions = np.zeros(len(X), dtype=int)
-    probabilities = np.full(len(X), np.nan, dtype=float)
+    n = len(X)
+    indices = np.arange(n)
+    predictions = np.zeros(n, dtype=int)
+    probabilities = np.full(n, np.nan, dtype=float)
     loo = LeaveOneOut()
 
-    for train_idx, test_idx in loo.split(indices):
+    print(f"  Running LOO on {n} samples for {bundle.name}...", flush=True)
+    for i, (train_idx, test_idx) in enumerate(loo.split(indices)):
+        if (i + 1) % 20 == 0 or (i + 1) == n:
+            print(f"    Progress: {i + 1}/{n}", flush=True)
         X_train = X.iloc[train_idx]
         y_train = y.iloc[train_idx]
         X_test = X.iloc[test_idx]
         est = clone(bundle.model)
         sample_weight = compute_sample_weight("balanced", y_train)
-        try:
-            est.fit(X_train, y_train, sample_weight=sample_weight)
-        except TypeError:
-            est.fit(X_train, y_train)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                est.fit(X_train, y_train, sample_weight=sample_weight)
+            except TypeError:
+                est.fit(X_train, y_train)
         pred = est.predict(X_test)[0]
         predictions[test_idx[0]] = pred
         if hasattr(est, "predict_proba"):
@@ -251,36 +262,54 @@ def main() -> None:
     blood_bundle = align_bundle_to_individuals(blood_bundle, blood_metadata)
     brain_bundle = align_bundle_to_individuals(brain_bundle, brain_metadata)
 
-    shared_ids = blood_bundle.specimen_ids[blood_bundle.specimen_ids.isin(brain_bundle.specimen_ids)]
-    shared_ids = pd.Index(shared_ids.unique())
-    if shared_ids.empty:
-        raise ValueError("No overlapping specimen IDs between blood and brain datasets before prediction")
-    print(f"Found {len(shared_ids)} shared specimens before prediction.")
+    # Identify unique tissues in brain metadata
+    if 'tissue' not in brain_metadata.columns:
+        raise ValueError("'tissue' column missing from brain metadata. Cannot split by DLPFC/PCC.")
+    tissues = ["DLPFC", "PCC"]
+    for tissue in tissues:
+        print(f"\n=== Running Blood vs {tissue} comparison ===")
+        # Filter brain metadata and bundle for this tissue
+        brain_meta_tissue = brain_metadata[brain_metadata['tissue'].str.upper() == tissue.upper()]
+        if brain_meta_tissue.empty:
+            print(f"No samples found for tissue {tissue} in brain metadata. Skipping.")
+            continue
+        brain_ids_tissue = pd.Index(brain_meta_tissue['individual_clean'].unique())
+        # Subset brain bundle to only these individuals
+        brain_bundle_tissue = subset_bundle(brain_bundle, brain_ids_tissue.intersection(brain_bundle.features.index))
+        # Find intersection with blood
+        shared_ids = blood_bundle.specimen_ids[blood_bundle.specimen_ids.isin(brain_bundle_tissue.specimen_ids)]
+        shared_ids = pd.Index(shared_ids.unique())
+        if shared_ids.empty:
+            print(f"No overlapping specimen IDs between blood and {tissue} datasets before prediction. Skipping.")
+            continue
+        print(f"Found {len(shared_ids)} shared specimens for Blood vs {tissue}.")
+        blood_bundle_tissue = subset_bundle(blood_bundle, shared_ids)
+        brain_bundle_tissue = subset_bundle(brain_bundle_tissue, shared_ids)
+        describe_intersection(blood_bundle_tissue, brain_bundle_tissue, brain_metadata)
 
-    blood_bundle = subset_bundle(blood_bundle, shared_ids)
-    brain_bundle = subset_bundle(brain_bundle, shared_ids)
-    describe_intersection(blood_bundle, brain_bundle, brain_metadata)
+        blood_eval = leave_one_out_predict(blood_bundle_tissue)
+        brain_eval = leave_one_out_predict(brain_bundle_tissue)
 
-    blood_eval = leave_one_out_predict(blood_bundle)
-    brain_eval = leave_one_out_predict(brain_bundle)
+        merged_preview = merge_prediction_frames(blood_eval, brain_eval)
+        if args.preview_output:
+            out_path = args.preview_output.parent / f"preview_merged_{args.task}_{tissue}.csv"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            merged_preview.to_csv(out_path)
+            print(f"Preview merged predictions saved to {out_path}")
 
-    merged_preview = merge_prediction_frames(blood_eval, brain_eval)
-    if args.preview_output:
-        args.preview_output.parent.mkdir(parents=True, exist_ok=True)
-        merged_preview.to_csv(args.preview_output)
-        print(f"Preview merged predictions saved to {args.preview_output}")
+        # Save comparison results with tissue in filename
+        output_path = args.output.parent / f"comparison_results_{args.task}_{tissue}.csv"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        comparison = compare_predictions(merged_preview, args.task)
+        comparison.to_csv(output_path)
 
-    comparison = compare_predictions(merged_preview, args.task)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    comparison.to_csv(args.output)
-
-    summary = comparison["better_model"].value_counts().to_dict()
-    total = len(comparison)
-    print(f"Compared {total} shared specimens. Distribution of better models:")
-    for key in ("blood", "brain", "both", "neither"):
-        count = summary.get(key, 0)
-        print(f"  {key:<7}: {count:>3} ({count / total:.1%})")
-    print(f"Detailed results saved to {args.output}")
+        summary = comparison["better_model"].value_counts().to_dict()
+        total = len(comparison)
+        print(f"Compared {total} shared specimens for Blood vs {tissue}. Distribution of better models:")
+        for key in ("blood", "brain", "both", "neither"):
+            count = summary.get(key, 0)
+            print(f"  {key:<7}: {count:>3} ({count / total:.1%})")
+        print(f"Detailed results saved to {output_path}")
 
 
 if __name__ == "__main__":
