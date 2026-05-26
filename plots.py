@@ -12,19 +12,42 @@ DEFAULT_CSV = Path(__file__).resolve().parent / "files" / "log_model_comparison.
 DEFAULT_TASK_CSV = Path(__file__).resolve().parent / "files" / "task_comparison_metrics.csv"
 DEFAULT_HTML = Path(__file__).resolve().parent / "files" / "log_model_comparison_plot.html"
 DEFAULT_PNG = Path(__file__).resolve().parent / "files" / "log_model_comparison_plot.png"
+MODEL_CHOICES = ("rf", "xgb", "lr")
+DEFAULT_MODEL = "rf"
+DEFAULT_FILE_SUFFIX = "_retrain"
+MODEL_DISPLAY = {
+    "rf": "Balanced Random Forest",
+    "xgb": "XGBoost",
+    "lr": "Logistic Regression",
+}
 
-# LOO result files – one per (task, tissue) combination
-TASK_LOO_FILES = {
-    "AD_CONTROL_DLPFC":  Path(__file__).resolve().parent / "files" / "comparison_results_AD_CONTROL_DLPFC.csv",
-    "AD_CONTROL_PCC":    Path(__file__).resolve().parent / "files" / "comparison_results_AD_CONTROL_PCC.csv",
-    "MCI_CONTROL_DLPFC": Path(__file__).resolve().parent / "files" / "comparison_results_MCI_CONTROL_DLPFC.csv",
-    "MCI_CONTROL_PCC":   Path(__file__).resolve().parent / "files" / "comparison_results_MCI_CONTROL_PCC.csv",
+TASK_LOO_BASES = {
+    "AD_CONTROL_DLPFC": "comparison_results_AD_CONTROL_DLPFC",
+    "AD_CONTROL_PCC": "comparison_results_AD_CONTROL_PCC",
+    "MCI_CONTROL_DLPFC": "comparison_results_MCI_CONTROL_DLPFC",
+    "MCI_CONTROL_PCC": "comparison_results_MCI_CONTROL_PCC",
 }
 METRICS = (
     "accuracy",
     "f1",
     "roc_auc",
 )
+
+
+def normalize_suffix(suffix: str) -> str:
+    suffix = suffix.strip()
+    if not suffix:
+        return ""
+    return suffix if suffix.startswith("_") else f"_{suffix}"
+
+
+def build_task_loo_files(model: str, file_suffix: str) -> dict:
+    files_dir = Path(__file__).resolve().parent / "files"
+    suffix = normalize_suffix(file_suffix)
+    return {
+        key: files_dir / f"{base}_{model}{suffix}.csv"
+        for key, base in TASK_LOO_BASES.items()
+    }
 
 
 def load_comparison(csv_path: Path) -> pd.DataFrame:
@@ -128,7 +151,13 @@ def select_best_model(df: pd.DataFrame, task: str, source: str = "blood") -> str
     return task_df.loc[best_idx, "model"]
 
 
-def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Optional[pd.DataFrame] = None, tissue: Optional[str] = None):
+def make_figure(
+    long_df: pd.DataFrame,
+    single_task: Optional[str] = None,
+    df: Optional[pd.DataFrame] = None,
+    tissue: Optional[str] = None,
+    model_label: Optional[str] = None,
+):
     """Create a bar plot comparing blood vs brain model performance.
 
     Args:
@@ -149,14 +178,14 @@ def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Op
     long_df["task_original"] = long_df["task"]  # Keep original for filtering
     long_df["task"] = long_df["task"].apply(format_task_name)
 
-    tissue_label = f" – Blood vs {tissue}" if tissue else ""
+    dataset_label = f"Blood vs {tissue}" if tissue else "Blood vs Brain"
 
     if single_task:
         formatted_task = format_task_name(single_task)
 
         # Find best model for blood
         best_model = select_best_model(df, single_task, "blood")
-        print(f"Best model for {formatted_task}{tissue_label}: {best_model}")
+        print(f"Best model for {formatted_task} - {dataset_label}: {best_model}")
 
         # Filter to only the best model and the specified task
         plot_df = long_df[
@@ -190,7 +219,7 @@ def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Op
         fig.update_yaxes(range=[0, 1.05], title="Score")
         fig.update_xaxes(title="Metric")
         fig.update_layout(
-            title=f"{formatted_task}{tissue_label}<br>{best_model}",
+            title=f"{formatted_task} - {dataset_label} - {model_label or best_model}",
             legend_title_text="Dataset",
             bargap=0.15,
             template="plotly_white",
@@ -215,7 +244,7 @@ def make_figure(long_df: pd.DataFrame, single_task: Optional[str] = None, df: Op
             height=600,
         )
         fig.update_yaxes(matches=None, range=[0, 1])
-        title = f"Blood vs {tissue} Model Performance" if tissue else "Blood vs Brain Model Performance"
+        title = f"Task - {dataset_label} - {model_label or 'Model'}"
         fig.update_layout(
             title=title,
             legend_title_text="Dataset",
@@ -233,11 +262,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--png-out", type=Path, default=None, help="Optional path to save a static PNG (requires kaleido)")
     parser.add_argument("--no-show", action="store_true", help="Skip interactive figure display")
     parser.add_argument("--task", type=str, default=None, help="Filter to specific task (e.g., AD_CONTROL)")
+    parser.add_argument("--model", choices=MODEL_CHOICES, default=DEFAULT_MODEL, help="Model code to load for LOO files (rf/xgb/lr)")
+    parser.add_argument("--file-suffix", type=str, default=DEFAULT_FILE_SUFFIX, help="Suffix for LOO/model outputs (default: _retrain)")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
+    model_label = MODEL_DISPLAY.get(args.model, args.model.upper())
 
     count_plots()
 
@@ -245,7 +277,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.use_task_csv:
         # Use per-subject LOO files to build separate plots per tissue
-        loo_df = load_loo_comparison(TASK_LOO_FILES)
+        task_loo_files = build_task_loo_files(args.model, args.file_suffix)
+        print("Using LOO files:")
+        for key, path in task_loo_files.items():
+            print(f"  {key}: {path}")
+        loo_df = load_loo_comparison(task_loo_files)
         if loo_df.empty:
             print("No LOO comparison files found.")
             return
@@ -270,11 +306,11 @@ def main(argv: Optional[list[str]] = None) -> None:
                 if task_tissue_df.empty:
                     continue
                 long_df = melt_to_long(task_tissue_df)
-                fig = make_figure(long_df, single_task=task, df=task_tissue_df, tissue=tissue)
+                fig = make_figure(long_df, single_task=task, df=task_tissue_df, tissue=tissue, model_label=model_label)
 
                 tissue_str = f"_{tissue.lower()}" if tissue else ""
                 task_str = f"_{task.lower()}"
-                html_filename = f"task_comparison{task_str}{tissue_str}_plot.html"
+                html_filename = f"task_comparison{task_str}{tissue_str}_{args.model}_plot.html"
                 html_out = output_dir / html_filename
                 fig.write_html(html_out, include_plotlyjs="cdn")
                 print(f"Plot saved to: {html_out}")
@@ -288,12 +324,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         # Log-model comparison (not tissue-split)
         df = load_comparison(args.csv)
         long_df = melt_to_long(df)
-        fig = make_figure(long_df, single_task=args.task, df=df)
+        fig = make_figure(long_df, single_task=args.task, df=df, model_label=model_label)
 
         if args.html_out == DEFAULT_HTML:
             prefix = "log_model_comparison"
             task_suffix = f"_{args.task.lower()}" if args.task else ""
-            html_filename = f"{prefix}{task_suffix}_plot.html"
+            html_filename = f"{prefix}_{args.model}{task_suffix}_plot.html"
             html_out = output_dir / html_filename
         else:
             html_out = args.html_out
